@@ -39,10 +39,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Optional, Sequence, cast
 
-import numpy as np
-
 from pyomo.common.collections import ComponentMap
-from pyomo.common.dependencies import attempt_import
+from pyomo.common.dependencies import attempt_import, numpy as np
 from pyomo.common.errors import InfeasibleConstraintException
 from pyomo.common.tee import capture_output, TeeStream
 from pyomo.common.timing import HierarchicalTimer

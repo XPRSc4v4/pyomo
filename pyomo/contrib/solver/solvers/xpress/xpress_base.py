@@ -70,7 +70,6 @@ from pyomo.core.expr.numeric_expr import (
     UnaryFunctionExpression,
 )
 from pyomo.core.expr.visitor import StreamBasedExpressionVisitor
-from pyomo.core.expr import native_numeric_types
 from pyomo.core.base import Expression as NamedExpressionComponent
 from pyomo.core.expr.numvalue import value
 from pyomo.common.gc_manager import PauseGC
@@ -198,14 +197,11 @@ def _exit_external_function(visitor: 'XpressExpressionWalker', node, *data) -> A
     return xp.user(xp_cb, *xp_args, derivatives="always" if has_grad else "never")
 
 
-def _init_xpress() -> tuple:
+def _init_xpress(xp, xpress_available):
     """Populate all Pyomo<->Xpress entity maps. No-op if already done or if
     xpress did not import successfully."""
-
-    xp, xpress_available = attempt_import('xpress', catch_exceptions=(Exception,))
-
     if not xpress_available:
-        return xp, xpress_available
+        return
 
     _VAR_XP_TYPE_MAP.update(
         {
@@ -302,10 +298,8 @@ def _init_xpress() -> tuple:
         }
     )
 
-    return xp, xpress_available
 
-
-xp, xpress_available = _init_xpress()
+xp, xpress_available = attempt_import('xpress', callback=_init_xpress)
 
 
 def _register_pool_collector(prob, pool_limit: int) -> 'list[list[float]]':

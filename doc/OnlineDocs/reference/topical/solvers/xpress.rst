@@ -8,7 +8,7 @@ Pyomo provides two solver interfaces to the FICO Xpress solver:
 for workflows that solve a model repeatedly with small modifications
 between solves.
 
-Both connectors support the complete range of problem classes that Xpress
+Both interfaces support the complete range of problem classes that Xpress
 handles: LP, MIP, QP, MIQP, NLP, MINLP, second-order cone programs,
 and SOS Type 1 and 2 constraints.
 
@@ -17,7 +17,7 @@ Expression Walker
 
 :class:`XpressDirect` uses a custom expression walker that translates the
 full Pyomo expression tree (linear, quadratic, or nonlinear) directly
-into an equivalent Xpress expression object, avoiding further intermediate 
+into an equivalent Xpress expression object, avoiding further intermediate
 Python transformations, and handing off to the Xpress C library as directly
 as possible. Quadratic terms arising from Cartesian-product expansions are
 expanded on the C side. The result is a lean, single-path translation
@@ -30,7 +30,7 @@ symbolic (non-evaluated) coefficients that are used to register the
 mutable-parameter update helpers driving the targeted ``chgMCoef`` /
 ``chgRHS`` / ``chgQRowCoeff`` calls between solves. If a nonlinear
 subexpression remains after that decomposition, the same walker handles
-it, producing an Xpress nonlinear expression. 
+it, producing an Xpress nonlinear expression.
 
 XpressDirect
 ------------
@@ -83,7 +83,7 @@ full model rebuild.
 Incremental operations
 ^^^^^^^^^^^^^^^^^^^^^^
 
-Between solves the persistent connector supports:
+Between solves the persistent interface supports:
 
 - **LP/QP coefficient and bound updates** without row removal, using
   the Xpress ``chgMCoef`` / ``chgRHS`` / ``chgQRowCoeff`` API.
@@ -101,44 +101,25 @@ Between solves the persistent connector supports:
 Configuration
 -------------
 
-Both connectors accept a common set of configuration options passed as
-keyword arguments to :meth:`~XpressDirect.solve`. Options labelled
-*framework* are defined in the Pyomo solver framework base class and are
-expected to be supported by every compliant connector. Options labelled
-*connector* are specific to this Xpress implementation.
+Common configuration options (time limits, thread count, MIP gaps,
+symbolic labels, raw solver options, etc.) are documented on
+:class:`~pyomo.contrib.solver.common.config.BranchAndBoundConfig`, which
+both interfaces accept as keyword arguments to :meth:`~XpressDirect.solve`.
+
+Xpress-specific options:
 
 .. list-table::
    :header-rows: 1
-   :widths: 25 12 63
+   :widths: 25 75
 
    * - Option
-     - Scope
      - Description
-   * - ``time_limit``
-     - framework
-     - Wall-clock time limit in seconds.
-   * - ``threads``
-     - framework
-     - Number of solver threads.
-   * - ``rel_gap``
-     - framework
-     - Relative MIP optimality gap tolerance.
-   * - ``abs_gap``
-     - framework
-     - Absolute MIP optimality gap tolerance.
-   * - ``symbolic_solver_labels``
-     - framework
-     - Use Pyomo component names in the Xpress problem (aids debugging).
-   * - ``solver_options``
-     - framework
-     - Dict of raw solver control names forwarded directly to the solver.
    * - ``warmstart``
-     - connector
      - Pass variable values as a MIP start hint (default ``True``).
    * - ``pool_solutions``
-     - connector
-     - Collect multiple MIP solutions during B&B (0 = disabled). ``N > 0``:
-       keep a rolling window of the last ``N`` solutions found.
+     - Collect multiple MIP solutions during branch-and-bound.
+       ``N > 0``: keep a rolling window of the last ``N`` solutions 
+       found.
 
 Any Xpress control name accepted by ``prob.controls.<name>`` can be passed:
 
@@ -165,12 +146,11 @@ Every :meth:`~XpressDirect.solve` call returns a
    print(res.solution_status)         # e.g. optimal
    print(res.incumbent_objective)     # objective value at the best solution
 
-:attr:`~pyomo.contrib.solver.common.results.Results.termination_condition`
-reports why the solver stopped;
-:attr:`~pyomo.contrib.solver.common.results.Results.solution_status`
-reports what was returned. For NLP problems solved via Xpress SLP,
-``solution_status`` will be ``feasible`` rather than ``optimal``,
-reflecting the local convergence nature of the algorithm.
+See :class:`~pyomo.contrib.solver.common.results.Results` for the full set
+of attributes. For NLP problems solved via Xpress SLP,
+:attr:`~pyomo.contrib.solver.common.results.Results.solution_status` will
+be ``feasible`` rather than ``optimal``, reflecting the local convergence
+nature of the algorithm.
 
 Solution Pool
 -------------
@@ -215,20 +195,6 @@ NLP produces a MINLP.
 Testing
 -------
 
-The connector ships with a test suite covering LP, MIP, QP, QCP, NLP,
+The interface ships with a test suite covering LP, MIP, QP, QCP, NLP,
 MINLP, SOS, mutable parameter tracking, incremental structural updates,
 and the solution pool.
-
-.. note::
-
-   Development of this connector was aided by
-   `Claude Code <https://claude.ai/code>`_ (Anthropic).
-
-API Reference
--------------
-
-.. autosummary::
-   :toctree: generated/
-
-   XpressDirect
-   XpressPersistent

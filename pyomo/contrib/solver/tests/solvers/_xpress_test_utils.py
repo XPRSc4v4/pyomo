@@ -7,11 +7,7 @@
 # software.  This software is distributed under the 3-clause BSD License.
 # ____________________________________________________________________________________
 
-"""Shared test utilities for the Xpress connector test suite.
-
-Imported by test_xpress_direct.py and test_xpress_persistent.py.
-Not a test module itself (underscore prefix prevents pytest collection).
-"""
+"""Shared test utilities for the Xpress interface test suite."""
 
 import pyomo.environ as pyo
 
@@ -49,15 +45,7 @@ class _SolveExpected(TypedDict, total=False):
 
 
 def _solve_and_check(test_case, opt, model, expected: _SolveExpected, **solve_kwargs):
-    """Solve model, enforce baseline health checks, return the result.
-
-    Always asserts termination_condition and solution_status.
-    When status resolves to optimal, 'objective' and 'vars' are mandatory
-    in expected -- a test that solves optimally without checking the solution
-    is not a useful test.
-
-    **solve_kwargs: forwarded verbatim to opt.solve().
-    """
+    """Solve model and verify termination, status, objective, and variables."""
     tc_default = TerminationCondition.convergenceCriteriaSatisfied
     st_default = SolutionStatus.optimal
 
@@ -94,11 +82,7 @@ def _solve_and_check(test_case, opt, model, expected: _SolveExpected, **solve_kw
 
 
 def _trivial_model():
-    """Single bounded variable, no constraints, minimise x.
-
-    Used by persistent API surface tests that need a live xp.problem but do not
-    care about the specific solution (handles, controls, state checks, etc.).
-    """
+    """Minimal model: single bounded variable, no constraints."""
     m = pyo.ConcreteModel()
     m.x = pyo.Var(bounds=(0, 1))
     m.obj = pyo.Objective(expr=m.x)
@@ -106,11 +90,7 @@ def _trivial_model():
 
 
 def _solve_lp_no_load(opt):
-    """Return (model, result) for _simple_lp() solved with load_solutions=False.
-
-    Avoids the two-line preamble that is repeated in every test that exercises
-    the solution-loader interface (get_vars, get_duals, get_reduced_costs, etc.).
-    """
+    """Solve _simple_lp() with load_solutions=False. Return (model, result)."""
     m = _simple_lp()
     res = opt.solve(m, load_solutions=False)
     return m, res
@@ -126,15 +106,7 @@ def _solve_check_mutate_check(
     expected_after: _SolveExpected,
     **solve_kwargs,
 ):
-    """Two-step mutable param test: solve + check, mutate param, solve + check again.
-
-    Covers the pervasive pattern in persistent tests where one param change is
-    applied between two consecutive solves and both solutions are verified.
-    Returns (res_before, res_after).
-
-    Only use when there are no assertions that compare values across the two
-    solves (e.g. assertLess(x2, x1)). Those tests must keep explicit solve calls.
-    """
+    """Solve-check, mutate param, solve-check. Return solve result before and after."""
     res_before = _solve_and_check(
         test_case, opt, model, expected_before, **solve_kwargs
     )

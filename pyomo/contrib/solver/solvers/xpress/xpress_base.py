@@ -7,29 +7,7 @@
 # software.  This software is distributed under the 3-clause BSD License.
 # ____________________________________________________________________________________
 
-"""
-Shared infrastructure for the Xpress connector: expression walker, solution loaders,
-and the constraint/variable build helpers used by both XpressDirect and XpressPersistent.
-
-Architecture overview
----------------------
-The connector converts a Pyomo ConcreteModel into an xp.problem by walking every
-constraint body with XpressExpressionWalker, which turns each Pyomo expression tree
-into an equivalent Xpress expression object (xp.Sum, xp.constraint, etc.).
-
-This per-constraint walk approach handles LP, MIP, QP, QCP, and NLP in a single code
-path without special-casing. The linear walk fast path, PauseGC, and single-pass
-to_bounded_expression keep per-constraint overhead low enough that the flexibility
-comes at no practical cost.
-
-Mutable parameter tracking (XpressPersistent)
-----------------------------------------------
-XpressPersistent uses generate_standard_repn (in xpress_persistent.py) to identify
-mutable coefficients at set_instance time.  The walker here is a pure expression
-builder: it produces xp expressions from Pyomo expression trees but does not track
-which params affect which matrix entries.  All mutable tracking logic lives in
-xpress_persistent.py.
-"""
+"""Xpress interface: expression walker, solution loaders, and build helpers."""
 
 import datetime
 import io
@@ -72,6 +50,7 @@ from pyomo.core.expr.numvalue import value
 from pyomo.common.gc_manager import PauseGC
 from pyomo.repn.util import BeforeChildDispatcher
 
+from pyomo.common.config import ConfigValue, NonNegativeInt
 from pyomo.contrib.solver.common.base import SolverBase, Availability
 from pyomo.contrib.solver.common.config import BranchAndBoundConfig
 from pyomo.contrib.solver.common.results import (
@@ -90,37 +69,27 @@ from pyomo.contrib.solver.common.util import (
     NoOptimalSolutionError,
 )
 
-# ---- Pure-Python module-level constants (no xp dependency) ------------------
-
+# L: lower bound; B: upper bound.
 _BOUND_TYPE_CODES = ['L', 'U']
 
+# Element: (is_binary, is_integer) -> var type char as integer
 _VAR_TYPE_CODES: dict[tuple[bool, bool], int] = {
-    (True, True): 66,  # 'B' -- binary (implies integer)
-    (False, True): 73,  # 'I' -- integer
-    (False, False): 67,  # 'C' -- continuous
+    (True, True): 66,  # 'B': binary
+    (False, True): 73,  # 'I': integer
+    (False, False): 67,  # 'C': continuous
 }
 
-# ---- xp-dependent maps (empty until _init_xp_maps() is called) --------------
-# Mutable dicts so that `from .xpress_base import _OBJ_SENSE_MAP` in sibling
-# modules receives the same object and sees updates via .update().
-
-_VAR_XP_TYPE_MAP: dict = {}
-_OBJ_SENSE_MAP: dict = {}
-_SOL_STATUS_MAP: dict = {}
-_STOP_TYPE_MAP: dict = {}
-_XP_FUNCTION_MAP: dict = {}
-_CON_TYPE_MAP: dict = {}  # (is_range, is_equality, has_ub) -> xp constraint type
+# Xpress dependent maps, filled by _init_xp_maps
+_CON_TYPE_MAP: dict = {}  # (is_range, is_equality, has_ub) -> xpress constr type
+_OBJ_SENSE_MAP: dict = {}  # ObjectiveSense -> xpress.ObjSense
+_STOP_TYPE_MAP: dict = {}  # xpress.StopType -> TerminationCondition
+_SOL_STATUS_MAP: dict = {}  # xp.SolStatus -> (TerminationCondition, SolutionStatus)
+_VAR_XP_TYPE_MAP: dict = {}  # (is_binary, is_integer) -> xpress var type
+_XP_FUNCTION_MAP: dict = {}  # pyomo fn name -> xpress fn object
 
 
 class _ExitHandlerMap(dict):
-    """Dict with MRO fallback: unknown subclasses resolve via their base class.
-
-    Pyomo has many concrete expression subclasses (e.g. ScalarExpression) that
-    are not registered explicitly.  Walking the Python MRO finds the registered
-    base class handler (e.g. NamedExpressionComponent for all named expressions)
-    and caches the result so subsequent lookups are direct dict hits.
-    Only the minimal set of base classes needs to be registered.
-    """
+    """Dict with MRO fallback for unregistered expression subclasses."""
 
     def __missing__(self, key):
         for cls in key.__mro__:
@@ -151,52 +120,31 @@ def _exit_named_expression(visitor: 'XpressExpressionWalker', node, arg) -> Any:
 
 
 def _exit_external_function(visitor: 'XpressExpressionWalker', node, *data) -> Any:
-    """Handle ExternalFunctionExpression nodes via xp.user.
-
-    `data` is (xp_arg1, ..., xp_argN, fcn_id_int).  The last element is the
-    evaluated _PythonCallbackFunctionID (a plain Python int, not an xp expression).
-    Only PythonCallbackFunction is supported; AMPLExternalFunction has no
-    callable Python callbacks.
-    """
+    """Handle ExternalFunctionExpression: data is (xp_arg1, ..., xp_argN, fcn_id_int)."""
     pyo_fcn = node._fcn
     if not isinstance(pyo_fcn, PythonCallbackFunction):
         raise IncompatibleModelError(
-            f"ExternalFunction of type '{type(pyo_fcn).__name__}' uses AMPL callbacks "
-            "which are not supported by the Xpress connector. "
-            "Use PythonCallbackFunction instead."
+            f"ExternalFunction of type '{type(pyo_fcn).__name__}' is not supported; "
+            "only PythonCallbackFunction is supported."
         )
     xp_args = data[:-1]  # strip fcn_id (last element is always a plain int)
+    fcn_id = data[-1]
+    # No public accessor for gradient capability -> we test private members
     has_grad = pyo_fcn._grad is not None or pyo_fcn._fgh is not None
+    fgh = 1 if has_grad else 0
 
-    if pyo_fcn._fgh is not None:
-        _fgh = pyo_fcn._fgh
+    def xp_cb(*vals):
+        # evaluate_fgh() needs fcn_id and its derivative appended.
+        f, g, _ = pyo_fcn.evaluate_fgh([*vals, fcn_id], fixed=None, fgh=fgh)
+        return (f, *g[:-1]) if g is not None else f
 
-        def xp_cb(*vals):
-            f, g, _ = _fgh(list(vals), 1, None)
-            return (f, *g) if g is not None else f
-
-    elif pyo_fcn._grad is not None:
-        _fcn, _grad = pyo_fcn._fcn, pyo_fcn._grad
-
-        def xp_cb(*vals):
-            args = list(vals)
-            return (_fcn(*args), *_grad(args, None))
-
-    else:
-        _fcn = pyo_fcn._fcn
-
-        def xp_cb(*vals):
-            return _fcn(*vals)
-
-    # Xpress identifies user functions by their __name__; each distinct Pyomo
-    # ExternalFunction needs a unique name to avoid a "duplicate user function" error.
+    # Each ExternalFunction must have a unique __name__ in Xpress.
     xp_cb.__name__ = f'xp_user_{id(pyo_fcn)}'
     return xp.user(xp_cb, *xp_args, derivatives="always" if has_grad else "never")
 
 
 def _init_xpress(xp, xpress_available):
-    """Populate all Pyomo<->Xpress entity maps. No-op if already done or if
-    xpress did not import successfully."""
+    """Populate all Pyomo-Xpress entity maps."""
     if not xpress_available:
         return
 
@@ -218,7 +166,6 @@ def _init_xpress(xp, xpress_available):
     _SOL_STATUS_MAP.update(
         {
             xp.SolStatus.OPTIMAL: (TC.convergenceCriteriaSatisfied, SS.optimal),
-            # SLP (xp.user) reports FEASIBLE on completion: local optimum found.
             xp.SolStatus.FEASIBLE: (TC.convergenceCriteriaSatisfied, SS.feasible),
             xp.SolStatus.INFEASIBLE: (TC.provenInfeasible, SS.infeasible),
             xp.SolStatus.UNBOUNDED: (TC.unbounded, SS.unknown),
@@ -251,7 +198,7 @@ def _init_xpress(xp, xpress_available):
         }
     )
 
-    # 1:1 mapping from pyomo nodes to Xpress operators
+    # Pyomo nodes -> Xpress operators map
     _EXIT_HANDLERS.update(
         {
             NegationExpression: lambda v, n, a: -a,
@@ -269,8 +216,7 @@ def _init_xpress(xp, xpress_available):
         }
     )
 
-    # Pyomo defines many unary operators with a single class + a name attribute.
-    # We need a 2 levels dispatch with this second dict.
+    # Second level dispatch for unary operators (class + name attribute).
     _XP_FUNCTION_MAP.update(
         {
             'sin': xp.sin,
@@ -284,7 +230,6 @@ def _init_xpress(xp, xpress_available):
             'log10': xp.log10,
             'sqrt': xp.sqrt,
             'abs': xp.abs,
-            # Decomposed via xpress primitives -- same call signature as direct fns
             'sinh': lambda e: 0.5 * (xp.exp(e) - xp.exp(-e)),
             'cosh': lambda e: 0.5 * (xp.exp(e) + xp.exp(-e)),
             'tanh': lambda e: (xp.exp(e) - xp.exp(-e)) / (xp.exp(e) + xp.exp(-e)),
@@ -300,47 +245,63 @@ xp, xpress_available = attempt_import('xpress', callback=_init_xpress)
 
 
 def _register_pool_collector(prob, pool_limit: int) -> 'list[list[float]]':
-    """Register an IntsolCallback to collect MIP solutions during solve.
+    """Collect MIP solutions; pool[k] holds solution k+1 in discovery order.
 
-    Returns the list that will be populated by the callback.  Solution 0
-    (the incumbent) is always available via prob.getSolution(); pool[k] holds
-    the (k+1)-th solution kept in the rolling window.
-
-    pool_limit > 0: keep a rolling window of the last N solutions found.
-        When the window is full the oldest entry is evicted on each new solution,
-        so the pool always contains the N most recently found feasible solutions.
-
-    Zero overhead for LP/QP: the callback never fires for continuous problems.
+    pool_limit > 0: size of the rolling window of the last N solutions found.
     """
     pool: list[list[float]] = []
 
     def _intsol_cb(cbprob, cbdata):
         if len(pool) == pool_limit:
-            pool.pop(0)
+            pool.pop(0)  # Evict oldest when window is full
         pool.append(cbprob.getCallbackSolution())
 
-    # We set SERIALIZEPREINTSOL to ensure determinism in how solutions are found
-    prob.controls.serializepreintsol = 1
+    prob.controls.serializepreintsol = 1  # Deterministic solution order
     prob.addIntsolCallback(_intsol_cb)
     return pool
 
 
+class XpressConfig(BranchAndBoundConfig):
+    """Configuration options shared by Xpress interfaces."""
+
+    def __init__(
+        self,
+        description=None,
+        doc=None,
+        implicit=False,
+        implicit_domain=None,
+        visibility=0,
+    ):
+        super().__init__(
+            description=description,
+            doc=doc,
+            implicit=implicit,
+            implicit_domain=implicit_domain,
+            visibility=visibility,
+        )
+        self.pool_solutions: int = self.declare(
+            'pool_solutions',
+            ConfigValue(
+                default=0,
+                domain=NonNegativeInt,
+                description=(
+                    'MIP solution pool size (0 = disabled). '
+                    'N > 0: keep a rolling window of the last N solutions found.'
+                ),
+            ),
+        )
+        self.warmstart: bool = self.declare(
+            'warmstart',
+            ConfigValue(
+                default=True,
+                domain=bool,
+                description='Pass current integer variable values as a MIP warm start.',
+            ),
+        )
+
+
 class EntityMaps:
-    """Stable handle maps from Pyomo entities to Xpress entity objects.
-
-    Xpress entity handles (xp.var, xp.constraint, xp.sos) remain valid after
-    other entities are deleted, unlike integer indices, which Xpress renumbers
-    after every deletion.  Storing handles here eliminates all index rebuilds.
-
-    vars: keyed by id(VarData), not VarData itself, because VarData objects are
-      not hashable in all Pyomo versions and id() is stable for the lifetime of
-      the solve session.
-
-    cons: each constraint maps to a single xp.constraint handle. Range constraints
-      are stored as Xpress 'R'-type rows, one row per constraint.
-
-    sos: values are single xp.sos handles (SOS sets are never split).
-    """
+    """Stable handle maps: vars by id(VarData); cons and sos by entity."""
 
     def __init__(self, vars: dict, cons: dict, sos: dict):
         self.vars = vars  # id(VarData) -> xp.var
@@ -349,7 +310,7 @@ class EntityMaps:
 
 
 class XpressSolutionLoaderBase(SolutionLoader):
-    """Base solution loader shared by direct and persistent Xpress solvers."""
+    """Solution loader for Xpress solvers (direct and persistent)."""
 
     def __init__(
         self,
@@ -364,18 +325,13 @@ class XpressSolutionLoaderBase(SolutionLoader):
         self._pyomo_model = pyomo_model
         self._vars = variables
         self._maps = maps
-        # list[list[float]]: pool[k] = solution (k+1) in B&B discovery order.
-        # Populated by _register_pool_collector during prob.optimize().
         self._pool: list = pool_solutions if pool_solutions is not None else []
-        # Active solution id: 0 = incumbent (default). k > 0 = pool[k-1].
-        # _set_solution_id(None) is treated the same as 0 for framework compat.
-        self._active_id: int = 0
+        self._active_id: int = 0  # 0=incumbent (default), k>0=pool[k-1]
 
     def _query_vars(
         self, variables: Optional[Sequence[VarData]], fn, exc_type: type[Exception]
     ) -> Iterator[tuple[VarData, float]]:
-        """Query a variable-valued attribute from the Xpress problem, returning
-        (VarData, value) pairs. Raises exc_type on xp.ModelError."""
+        """Query variable-valued attribute; yields (VarData, value) pairs."""
         try:
             if variables is None:
                 return zip(self._vars, fn())
@@ -385,8 +341,6 @@ class XpressSolutionLoaderBase(SolutionLoader):
             raise exc_type() from e
 
     def get_number_of_solutions(self) -> int:
-        # LP/QP: pool stays empty, so returns 1 (the incumbent).
-        # MIP with pool_solutions > 0: incumbent + len(pool) collected solutions.
         return 1 + len(self._pool)
 
     def get_solution_ids(self) -> list:
@@ -400,14 +354,7 @@ class XpressSolutionLoaderBase(SolutionLoader):
     def _get_solution_vals(
         self, vars_to_load: Optional[Sequence[VarData]]
     ) -> Iterator[tuple[VarData, float]]:
-        """Yield (VarData, float) pairs for the currently active solution.
-
-        Active solution 0 or None -> incumbent via prob.getSolution().
-        Active solution k > 0     -> pool[k-1] (B&B discovery order).
-
-        For pool entries, values are indexed by xp.var.index (Xpress column
-        index), which matches the column registration order in self._vars.
-        """
+        """Yield (VarData, float) pairs for the active solution (0=incumbent, k>0=pool)."""
         sid = self._active_id
         if not sid:
             prob = self._xp_prob
@@ -451,8 +398,7 @@ class XpressSolutionLoaderBase(SolutionLoader):
         if self._active_id != 0:
             raise NoDualsError('Duals available only for incumbent (solution_id=0).')
         if cons_to_load is None:
-            # Note: Xpress cons order might differ from maps.cons dict order
-            #       thus, prob.getDuals() with no args is not viable here
+            # Explicit keys needed: Xpress cons order != maps.cons order
             cons_to_load = list(self._maps.cons.keys())
             xp_cons = list(self._maps.cons.values())
         else:
@@ -465,7 +411,7 @@ class XpressSolutionLoaderBase(SolutionLoader):
 
 
 class XpressSolverMixin(SolverBase):
-    """Shared logic for XpressDirect and XpressPersistent."""
+    """Shared solver logic (direct and persistent)."""
 
     _available = None
     _version = None
@@ -495,6 +441,7 @@ class XpressSolverMixin(SolverBase):
 
     @staticmethod
     def _var_bounds(var: VarData) -> tuple:
+        """Return variable bounds respecting fixed status."""
         if var.fixed:
             if var.value is None:
                 raise ValueError(f"Variable '{var.name}' is fixed but has no value.")
@@ -506,24 +453,19 @@ class XpressSolverMixin(SolverBase):
 
     @staticmethod
     def _set_var_types(prob, pyo_vars: list[VarData], xp_vars) -> None:
-        """Bulk-set column types (C/I/B) for pyo_vars."""
+        """Set column types in bulk."""
         ctypes = [_VAR_TYPE_CODES[v.is_binary(), v.is_integer()] for v in pyo_vars]
         prob.chgColType(xp_vars, ctypes)
 
     def _set_var_bounds(self, prob, pyo_vars: list[VarData], xp_vars) -> None:
-        """Bulk-set variable bounds for pyo_vars, respecting fixed-var pinning."""
+        """Set variable bounds in bulk."""
         n = len(pyo_vars)
         cbounds = [b for var in pyo_vars for b in self._var_bounds(var)]
         cols = [v for v in xp_vars for _ in range(2)]
         prob.chgBounds(cols, _BOUND_TYPE_CODES * n, cbounds)
 
     def _add_vars_impl(self, prob, pyo_vars: list[VarData], symbolic_labels: bool):
-        """Add columns, set types and bounds. Returns the xp.var array.
-
-        Uses addVariables(n, name='') to get sequential C1/C2/... auto-names
-        that never repeat across incremental calls. Without name='', Xpress
-        generates x(0)/x(1)/... which conflict on a second batch.
-        """
+        """Add columns and set types/bounds. Return xp.var array."""
         n = len(pyo_vars)
         if n == 0:
             return []
@@ -543,17 +485,7 @@ class XpressSolverMixin(SolverBase):
         walker: 'XpressExpressionWalker',
         symbolic_labels: bool,
     ) -> list:
-        """Walk pyo_cons and build xp.constraint objects in a single tight loop.
-
-        Performance choices:
-          - PauseGC wraps the loop: each walk creates many short-lived objects;
-            deferring GC eliminates unpredictable mid-loop pauses.
-          - to_bounded_expression called once per constraint to obtain (lb, body, ub)
-            together, avoiding three separate property accesses.
-          - _before_linear fast path: LinearExpression bodies (the common case for LP/MIP)
-            bypass the full StreamBasedExpressionVisitor dispatch, saving
-            initializeWalker + enterNode overhead.
-        """
+        """Walk pyomo constraints and build xp.constraint objects."""
         if len(pyo_cons) == 0:
             return []
         _walk_expr = walker.walk_expression
@@ -575,7 +507,7 @@ class XpressSolverMixin(SolverBase):
     def _add_sos_impl(
         prob, pyo_sos: list, var_map: dict[int, Any], symbolic_labels: bool = False
     ):
-        """Add SOS sets. Returns the xp.sos handle array."""
+        """Add SOS sets. Return xp.sos handle array."""
         n = len(pyo_sos)
         if n == 0:
             return []
@@ -753,7 +685,7 @@ class XpressSolverMixin(SolverBase):
 
 
 def _register_variable(visitor: 'XpressExpressionWalker', pyo_var: VarData):
-    """Return the xp.var for pyo_var, registering it in prob/var_map on first use."""
+    """Register (or get) pyo_var in prob. Return its xp.var."""
     xp_var = visitor.var_map.get(id(pyo_var))
     if xp_var is not None:
         return xp_var
@@ -775,8 +707,6 @@ def _before_monomial(visitor: 'XpressExpressionWalker', child: MonomialTermExpre
 
 
 def _before_linear(visitor: 'XpressExpressionWalker', child: LinearExpression):
-    # child.args bypasses LinearExpression._build_cache.
-    # xp.Sum(list) is a single C call; Python + accumulation is O(n) calls.
     terms = []
     for arg in child.args:
         if isinstance(arg, VarData):
@@ -828,15 +758,7 @@ class XpressBeforeChildDispatcher(BeforeChildDispatcher):
 
 
 class XpressExpressionWalker(StreamBasedExpressionVisitor):
-    """Pyomo expression tree -> Xpress expression objects.
-
-    Pure expression builder: no ExprType tracking, no mutable param tracking.
-    Each node type maps directly to its Xpress operation in _EXIT_HANDLERS.
-    Mutable tracking is handled by generate_standard_repn in xpress_persistent.py.
-
-    _before_linear provides a fast path for LinearExpression bodies (the dominant
-    case in LP/MIP models) via direct call from _add_cons_impl.
-    """
+    """Pyomo expression tree -> Xpress expression objects."""
 
     before_child_dispatcher = XpressBeforeChildDispatcher()
 

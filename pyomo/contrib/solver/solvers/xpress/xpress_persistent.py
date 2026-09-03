@@ -21,7 +21,6 @@ from pyomo.common.collections import ComponentMap
 from pyomo.repn import generate_standard_repn
 
 from pyomo.contrib.solver.common.base import PersistentSolverBase
-from pyomo.common.config import ConfigValue, NonNegativeInt
 from pyomo.contrib.solver.common.config import BranchAndBoundConfig
 from pyomo.contrib.solver.common.util import (
     IncompatibleModelError,
@@ -40,6 +39,7 @@ from .xpress_base import (
     XpressSolutionLoaderBase,
     EntityMaps,
     XpressExpressionWalker,
+    XpressConfig,
     _OBJ_SENSE_MAP,
     _CON_TYPE_MAP,
     _register_pool_collector,
@@ -74,28 +74,25 @@ def _refix(fixed: ComponentMap) -> None:
 
 
 class _UpdateBatch:
-    """Accumulates constraint updates for a single flush.
+    """Accumulates constraint updates.
 
-    LP/QP affine updates are applied first (no structural changes, indices stable).
-    NL rebuilds follow as a single batched delConstraint + addConstraint pair.
-    The new xp.constraint objects are built during collect() so flush() needs
-    only prob, maps, and mutable_helpers.
+    Applies LP/QP chgMCoef/chgRHS first, then NL delConstraint+addConstraint.
     """
 
     def __init__(self):
-        # parallel lists for chgMCoef(rows, cols, vals)
+        # chgMCoef(rows, cols, vals)
         self.coef_rows = []
         self.coef_cols = []
         self.coef_vals = []
-        # parallel lists for chgRHS(rows, vals)
+        # chgRHS(rows, vals)
         self.rhs_rows = []
         self.rhs_vals = []
-        # parallel lists for chgRHSRange(rows, vals)
+        # chgRHSRange(rows, vals)
         self.rng_rows = []
         self.rng_vals = []
-        # list of (row, col1, col2, val) tuples for chgQRowCoeff
+        # chgQRowCoeff(row, col1, col2, val)
         self.quad_updates = []
-        # NL row replacement: old handles for delConstraint, new for addConstraint
+        # delConstraint(old_cons), addConstraint(new_cons)
         self.nl_old_cons = []
         self.nl_new_cons = []
 
@@ -114,21 +111,10 @@ class _UpdateBatch:
 
 
 class _MutableConstraint:
-    """Handles mutable-param updates for a constraint row.
+    """Updates mutable params in constraint rows.
 
-    LP/QP path (nl_expr is None): targeted chgMCoef/chgRHS/chgQRowCoeff updates.
-    NL path (nl_expr set): full row rebuild -- re-walks nl_expr only; reconstructs
-    the rest from a precomputed stable xp expression and parallel coef lists.
-
-    generate_standard_repn guarantees unique variable entries so parallel lists
-    suffice -- no dict accumulation needed.
-
-    _rhs_expr: bound - body_constant (Pyomo expr). For NL, always set (even when
-               non-mutable) since it is needed for the rebuild's xp.constraint call.
-    _rng_expr: ub - lb for range constraints (Pyomo expr). Same rule as _rhs_expr.
-    _type:     xp constraint type (leq/geq/eq/rng), stored for NL rebuild only.
-    _stable_xp: precomputed xp expression for the non-mutable lin+quad body terms.
-                None for LP/QP (not needed for targeted updates).
+    LP/QP: targeted chgMCoef/chgRHS/chgQRowCoeff.
+    NL: partial rebuild via re-walk of nl_expr.
     """
 
     __slots__ = (
@@ -161,15 +147,10 @@ class _MutableConstraint:
         stable_xp: Any,
         nl_expr: Any,
     ) -> None:
-        # ConstraintData; needed to update maps.cons after NL rebuild
         self._con = con
-        # xp.constraint handle; updated in-place after each NL rebuild
         self._xp_con = xp_con
-        # mutable linear xp.var handles (parallel with _lin_coefs)
         self._lin_vars = lin_vars
-        # mutable linear Pyomo coef expressions
         self._lin_coefs = lin_coefs
-        # mutable quad var handles, parallel triplet (_quad_v1s, _quad_v2s, _quad_coefs)
         self._quad_v1s = quad_v1s
         self._quad_v2s = quad_v2s
         self._quad_coefs = quad_coefs
@@ -177,7 +158,6 @@ class _MutableConstraint:
         self._rng_expr = rng_expr
         self._type = con_type
         self._stable_xp = stable_xp
-        # repn.nonlinear_expr; None for LP/QP, set for NL constraints
         self._nl_expr = nl_expr
 
     def collect(self, batch: _UpdateBatch, walker, use_names: bool, maps) -> None:
@@ -236,16 +216,7 @@ def _assemble_xp_expr(
     constant,
     nl_expr,
 ) -> Any:
-    """Assemble a single Xpress expression from precomputed parts.
-
-    Coefs may be Pyomo expressions or pre-evaluated floats; value() is called on
-    each one. All vars must already be xp.var handles.
-    stable_xp is a precomputed xp expression (or None if absent).
-    constant is a Pyomo expression, float, or None; value() is called if not None.
-    nl_expr is a walked xp expression (or None).
-
-    Uses xp.Sum([...]) so stable_xp is never aliased or mutated.
-    """
+    """Assemble Xpress expression from precomputed parts."""
     parts = []
     if stable_xp is not None:
         parts.append(stable_xp)
@@ -261,13 +232,10 @@ def _assemble_xp_expr(
 
 
 class _MutableObjective:
-    """Handles mutable-param updates for the objective function.
+    """Updates mutable params in the objective.
 
-    Mirrors _MutableConstraint: both LP/QP and NL paths share parallel coef lists.
-    NL additionally carries _stable_xp and _nl_expr (re-walked on every update).
-
-    LP/QP: chgObj(keys+[-1], vals+[const]) + chgMQObj (Hessian-scaled at update time).
-    NL:    setObjective(stable_xp + mutable_terms + const + nl_part).
+    LP/QP: chgObj + chgMQObj.
+    NL: full setObjective with re-walked nl_expr.
     """
 
     __slots__ = (
@@ -292,32 +260,26 @@ class _MutableObjective:
         stable_xp: Any,
         nl_expr: Any,
     ) -> None:
-        # mutable linear xp.var handles and Pyomo coef expressions (parallel)
         self._lin_vars = lin_vars
         self._lin_coefs = lin_coefs
-        # mutable quad var handles and coefs, parallel triplet
         self._quad_v1s = quad_v1s
         self._quad_v2s = quad_v2s
         self._quad_coefs = quad_coefs
-        # LP/QP: mutable Pyomo expr or None; NL: repn.constant always (may be 0)
         self._constant = constant
-        # non-mutable lin+quad body as a precomputed xp expr; None for LP/QP
         self._stable_xp = stable_xp
-        # repn.nonlinear_expr; None for LP/QP objectives
         self._nl_expr = nl_expr
 
     def update(self, prob, walker: 'XpressExpressionWalker') -> None:
         if self._nl_expr is None:
             if self._constant is not None:
+                # -1 is the objective index. chgObj negates objective value internally.
                 prob.chgObj([-1], [-value(self._constant)])
             if len(self._lin_vars) > 0:
                 vals = [value(c) for c in self._lin_coefs]
                 prob.chgObj(self._lin_vars, vals)
             if len(self._quad_v1s) > 0:
-                # Xpress stores the QP objective as (1/2)*x'Qx, so chgMQObj
-                # expects Hessian-scaled values. Off-diagonal entries appear twice
-                # in the symmetric Hessian (which compensates), diagonal entries
-                # must be doubled to match the user-visible coefficient.
+                # Xpress QP objective: (1/2)*x'Qx; chgMQObj expects Hessian-scaled values.
+                # Diagonal entries must be doubled. Off-diagonal appear twice in symmetric Hessian.
                 prob.chgMQObj(
                     self._quad_v1s,
                     self._quad_v2s,
@@ -344,7 +306,7 @@ class _MutableObjective:
 
 
 class XpressPersistentSolutionLoader(XpressSolutionLoaderBase):
-    """Solution loader for XpressPersistent -- invalidated before each re-solve."""
+    """Solution loader. Invalidated before re-solve."""
 
     def __init__(
         self,
@@ -390,8 +352,8 @@ class XpressPersistentSolutionLoader(XpressSolutionLoaderBase):
         return super().get_reduced_costs(vars_to_load)
 
 
-class XpressPersistentConfig(BranchAndBoundConfig):
-    """Configuration for XpressPersistent."""
+class XpressPersistentConfig(XpressConfig):
+    """Config for XpressPersistent."""
 
     def __init__(
         self,
@@ -401,7 +363,8 @@ class XpressPersistentConfig(BranchAndBoundConfig):
         implicit_domain=None,
         visibility=0,
     ):
-        super().__init__(
+        XpressConfig.__init__(
+            self,
             description=description,
             doc=doc,
             implicit=implicit,
@@ -409,55 +372,25 @@ class XpressPersistentConfig(BranchAndBoundConfig):
             visibility=visibility,
         )
         self.auto_updates = self.declare('auto_updates', AutoUpdateConfig())
-        self.warmstart: bool = self.declare(
-            'warmstart',
-            ConfigValue(
-                default=True,
-                domain=bool,
-                description='Pass current integer variable values as a MIP warm start.',
-            ),
-        )
-        self.pool_solutions: int = self.declare(
-            'pool_solutions',
-            ConfigValue(
-                default=0,
-                domain=NonNegativeInt,
-                description=(
-                    'MIP solution pool size (0 = disabled). '
-                    'N > 0: keep a rolling window of the last N solutions found.'
-                ),
-            ),
-        )
 
 
 class XpressPersistent(XpressSolverMixin, PersistentSolverBase, Observer):
-    """Persistent Xpress solver: reuses the xp.problem() across re-solves."""
+    """Persistent Xpress solver Interface."""
 
     CONFIG = XpressPersistentConfig()
 
     def __init__(self, **kwds):
         super().__init__(**kwds)
-        # active xp.problem(); None until set_instance
-        self._xp_prob = None
-        # model currently loaded; identity-checked on re-solve
+        self._xp_prob = None  # xpress.problem() object
         self._pyomo_model: Optional[BlockData] = None
-        # ordered VarData list; used for batch unfix before repn calls
         self._vars: Optional[list[VarData]] = None
-        # Pyomo->Xpress handle maps (vars, cons, sos)
-        self._maps: Optional[EntityMaps] = None
-        # active Pyomo objective; None if model has no objective
-        self._objective: Optional[ObjectiveData] = None
-        # invalidated on every model change; prevents stale solution reads
+        self._maps: Optional[EntityMaps] = None  # Pyomo -> Xpress entities maps
+        self._objective: Optional[ObjectiveData] = None  # Active Pyomo objective
         self._last_solution_loader: Optional[XpressPersistentSolutionLoader] = None
-        # watches model for changes and notifies this observer
         self._change_detector: Optional[ModelChangeDetector] = None
-        # per-constraint update helpers (LP/QP targeted or NL rebuild)
         self._mutable_helpers: dict[ConstraintData, _MutableConstraint] = {}
-        # None when objective has no mutable params
         self._mutable_objective: Optional[_MutableObjective] = None
-        # drives symbolic names in Xpress (symbolic_solver_labels config)
-        self._use_names: bool = False
-        # lazily initialised on first NL walk; reused across all walks
+        self._use_names: bool = False  # symbolic_solver_labels config
         self._walker: XpressExpressionWalker | None = None
 
     def _clear(self):
@@ -580,7 +513,7 @@ class XpressPersistent(XpressSolverMixin, PersistentSolverBase, Observer):
     # -----------------------------------------------------------------------
 
     def _build_xp_from_repn(self, repn) -> Any:
-        """Build an Xpress expression from a StandardRepn (linear + quadratic parts)."""
+        """Build Xpress expression from StandardRepn."""
         var_map = self._maps.vars
         nl_expr = None
         if repn.nonlinear_expr is not None:
@@ -912,23 +845,19 @@ class XpressPersistent(XpressSolverMixin, PersistentSolverBase, Observer):
 
     def remove_block(self, block: BlockData) -> None:
         assert self._change_detector is not None
-        old_cons = list(
-            block.component_data_objects(Constraint, descend_into=True, active=True)
-        )
-        old_sos = list(
-            block.component_data_objects(SOSConstraint, descend_into=True, active=True)
-        )
+        old_cons = list(block.component_data_objects(Constraint, active=True))
+        old_sos = list(block.component_data_objects(SOSConstraint, active=True))
         if len(old_cons) > 0:
             self._change_detector.remove_constraints(old_cons)
         if len(old_sos) > 0:
             self._change_detector.remove_sos_constraints(old_sos)
 
     def has_instance(self) -> bool:
-        """Return True if set_instance has been called and a model is loaded."""
+        """True if set_instance has been called."""
         return self._pyomo_model is not None
 
     def get_xpress_problem(self) -> Any:
-        """Return the underlying xp.problem object for direct Xpress API access."""
+        """Return underlying xp.problem for direct Xpress API access."""
         assert self._xp_prob is not None
         return self._xp_prob
 
@@ -945,58 +874,43 @@ class XpressPersistent(XpressSolverMixin, PersistentSolverBase, Observer):
         return self._xp_prob.getAttrib(*args)
 
     def get_xpress_var(self, var: VarData) -> Any:
-        """Return the xp.var handle for a Pyomo variable."""
+        """Return xp.var handle for a Pyomo variable."""
         assert self._maps is not None
         return self._maps.vars[id(var)]
 
     def get_xpress_constraint(self, con: ConstraintData) -> Any:
-        """Return the xp.constraint handle for a Pyomo constraint."""
+        """Return xp.constraint handle for a Pyomo constraint."""
         assert self._maps is not None
         return self._maps.cons[con]
 
     def get_xpress_sos(self, con: SOSConstraintData) -> Any:
-        """Return the xp.sos handle for a Pyomo SOS constraint."""
+        """Return xp.sos handle for a Pyomo SOS constraint."""
         assert self._maps is not None
         return self._maps.sos[con]
 
     def release(self) -> None:
-        """Drop the xp.problem and release all solver resources."""
+        """Drop xp.problem and release solver resources."""
         self._clear()
 
     def reset(self) -> None:
-        """Clear all model data from the xp.problem, then drop it."""
+        """Clear model data from xp.problem, then drop it."""
         if self._xp_prob is not None:
             self._xp_prob.reset()
         self._clear()
 
     def write(self, filename: str, flags: str = '') -> None:
-        """Write the loaded Xpress problem to a file."""
+        """Write loaded Xpress problem to file."""
         self._xp_prob.writeProb(filename, flags)
 
     def write_iis(self, filename: str) -> str:
-        """Compute the IIS and write it to filename in LP format.
-
-        Must be called after an infeasible solve.  Raises if no model is
-        loaded or if Xpress cannot compute an IIS.
-
-        Returns the filename written.
-        """
+        """Compute IIS and write to filename in LP format. Must follow infeasible solve."""
         assert self._xp_prob is not None
         self._xp_prob.firstIIS(1)
         self._xp_prob.writeIIS(1, 0, filename, 'l')
         return filename
 
     def get_iis(self) -> dict:
-        """Compute the IIS and return the conflicting Pyomo objects.
-
-        Must be called after an infeasible solve.  Raises if no model is
-        loaded or if Xpress cannot compute an IIS.
-
-        Returns a dict with keys:
-            'constraints': list[ConstraintData] -- Pyomo constraints in the IIS
-            'variables':   list[VarData]         -- Pyomo variables whose bounds
-                                                    contribute to the IIS
-        """
+        """Compute IIS and return conflicting Pyomo objects."""
         assert self._xp_prob is not None and self._maps is not None
         self._xp_prob.firstIIS(1)
         rowind, colind, *_ = self._xp_prob.getIISData(1)

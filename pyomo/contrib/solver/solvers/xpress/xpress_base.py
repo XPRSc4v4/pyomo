@@ -69,7 +69,7 @@ from pyomo.contrib.solver.common.util import (
     NoOptimalSolutionError,
 )
 
-# L: lower bound; B: upper bound.
+# L: lower bound; U: upper bound.
 _BOUND_TYPE_CODES = ['L', 'U']
 
 # Element: (is_binary, is_integer) -> var type char as integer

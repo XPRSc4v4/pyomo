@@ -317,7 +317,7 @@ class TestXpressDirect(unittest.TestCase):
         self.assertAlmostEqual(duals[m.c2], 0.0, places=6)
 
 
-@unittest.pytest.mark.solver('xpress_persistent')
+@unittest.pytest.mark.solver('xpress_direct')
 class TestXpressDirectQuadratic(unittest.TestCase):
     def setUp(self):
         self.opt = XpressDirect()
@@ -358,7 +358,7 @@ class TestXpressDirectQuadratic(unittest.TestCase):
         _solve_and_check(self, self.opt, m, {'objective': 1.0, 'vars': [(m.x, 1.0)]})
 
 
-@unittest.pytest.mark.solver('xpress_persistent')
+@unittest.pytest.mark.solver('xpress_direct')
 class TestXpressDirectMisc(unittest.TestCase):
     def setUp(self):
         self.opt = XpressDirect()
@@ -487,7 +487,7 @@ class TestXpressDirectMisc(unittest.TestCase):
             self.assertEqual(os.getcwd(), original_cwd)
 
 
-@unittest.pytest.mark.solver('xpress_persistent')
+@unittest.pytest.mark.solver('xpress_direct')
 class TestXpressDirectNLP(unittest.TestCase):
     def setUp(self):
         self.opt = XpressDirect()
@@ -547,7 +547,6 @@ class TestXpressDirectNLP(unittest.TestCase):
         _solve_and_check(self, self.opt, m, {'objective': 0.0, 'vars': [(m.x, 2.0)]})
 
 
-@unittest.pytest.mark.solver('xpress_persistent')
 @unittest.pytest.mark.solver('xpress_direct')
 class TestXpressExternalFunction(unittest.TestCase):
     def setUp(self):

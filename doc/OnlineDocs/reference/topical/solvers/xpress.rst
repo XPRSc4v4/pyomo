@@ -191,10 +191,3 @@ These operations must be reformulated by introducing an auxiliary integer
 variable together with two linear inequality constraints that encode the
 floor or ceil relationship. Adding an integer variable to a continuous
 NLP produces a MINLP.
-
-Testing
--------
-
-The interface ships with a test suite covering LP, MIP, QP, QCP, NLP,
-MINLP, SOS, mutable parameter tracking, incremental structural updates,
-and the solution pool.
